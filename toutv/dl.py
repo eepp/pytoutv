@@ -33,6 +33,7 @@ import errno
 import struct
 import requests
 from Crypto.Cipher import AES
+import concurrent.futures as cf
 import toutv.config
 import toutv.exceptions
 import toutv.m3u8
@@ -176,13 +177,15 @@ class Downloader:
             encrypted_ts_segment += chunk
             self._done_bytes += len(chunk)
 
-            if chunks_count % 32 == 0:
-                self._notify_progress_update()
+            #if chunks_count % 32 == 0:
+            #    self._notify_progress_update()
             chunks_count += 1
 
         aes_iv = struct.pack('>IIII', 0, 0, 0, count)
         aes = AES.new(self._key, AES.MODE_CBC, aes_iv)
         ts_segment = aes.decrypt(bytes(encrypted_ts_segment))
+
+        return len(ts_segment)
 
         try:
             self._of.write(ts_segment)
@@ -208,6 +211,7 @@ class Downloader:
         # get video playlist
         r = self._do_request(stream.uri)
         m3u8_file = r.text
+        #print(m3u8_file)
         self._video_playlist = toutv.m3u8.parse(m3u8_file,
                                                 os.path.dirname(stream.uri))
         self._segments = self._video_playlist.segments
@@ -218,13 +222,20 @@ class Downloader:
         r = self._do_request(uri)
         self._key = r.content
 
-        # download segments
-        with open(self._output_path, 'wb') as self._of:
-            self._notify_dl_start()
-            self._notify_progress_update()
+        # start concurrent downloads
+        with cf.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_segment = {executor.submit(self._download_segment, seg): seg for seg in range(len(self._segments))}
 
-            for segindex in range(len(self._segments)):
-                self._download_segment(segindex)
-                self._done_segments += 1
-                self._done_segments_bytes = self._done_bytes
-                self._notify_progress_update()
+            for future in cf.as_completed(future_to_segment):
+                segindex = future_to_segment[future]
+
+                try:
+                    result = future.result()
+                except Exception as e:
+                    print('Error: segment {}: {}'.format(segindex, e))
+
+                    # cancel everything
+                    for future in future_to_segment:
+                        future.cancel()
+                else:
+                    print('segment {} done: {} bytes'.format(segindex, result))
